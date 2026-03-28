@@ -1,11 +1,12 @@
 use mio::{Events, Interest, Poll, Token};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::task::{Wake, Waker};
+use std::time::{Instant};
 
 thread_local! {
     pub static REACTOR_HANDLE: RefCell<Option<ReactorHandle>> = RefCell::new(None);
@@ -30,7 +31,7 @@ impl Executor {
     }
 
     pub fn block_on(mut self) {
-        println!("Started blocking");
+        // println!("Started blocking");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut reactor = Reactor::new();
         REACTOR_HANDLE.with(|r| {
@@ -39,12 +40,14 @@ impl Executor {
 
         loop {
             while let Some(task_id) = self.ready_queue.pop_front() {
-                println!("running task {}", task_id);
+                // println!("running task {}", task_id);
                 let waker = MyWaker::new(task_id, tx.clone());
                 let waker = Waker::from(Arc::new(waker));
                 let cx = &mut std::task::Context::from_waker(&waker);
                 let task = self.tasks.get_mut(&task_id).unwrap();
+                // println!("polling task {}", task_id);
                 let result = task.future.as_mut().poll(cx);
+                // println!("poll result: {:?}", result);
                 match result {
                     std::task::Poll::Ready(()) => {
                         self.tasks.remove(&task_id);
@@ -114,29 +117,50 @@ impl Reactor {
     }
 
     pub fn epoll(&mut self) {
-        let _ = self.poll.poll(&mut self.events, None);
-        for event in self.events.iter() {
-            println!("Running Epoll");
-            let token = event.token();
-            REACTOR_HANDLE.with(|r| {
-                let mut handle = r.borrow_mut();
-                let handle = handle.as_mut().unwrap();
-                let waker = handle
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .waiters
-                    .remove(&token)
-                    .unwrap();
-                waker.wake();
-            })
-        }
+        // println!("Epoll waiting ma man");
+        REACTOR_HANDLE.with(|r| {
+            let mut handle_ref = r.borrow_mut();
+            let handle = handle_ref.as_mut().unwrap();
+            let mut shared = handle.shared.lock().unwrap();
+
+            let timeout = handle
+                .timers
+                .peek()
+                .map(|nearest| nearest.0.0.saturating_duration_since(Instant::now()));
+
+            let _ = self.poll.poll(&mut self.events, timeout);
+
+            for event in self.events.iter() {
+                let token = event.token();
+
+                if let Some(waker) = shared.waiters.remove(&token) {
+                    waker.wake();
+                }
+            }
+
+            let now = Instant::now();
+
+            while let Some(nearest) = handle.timers.peek() {
+                let deadline = nearest.0.0;
+
+                if deadline > now {
+                    break;
+                }
+
+                let (_, token) = handle.timers.pop().unwrap().0;
+
+                if let Some(waker) = handle.shared.lock().unwrap().waiters.remove(&token) {
+                    waker.wake();
+                }
+            }
+        });
     }
 }
 
 pub struct ReactorHandle {
     pub registry: mio::Registry,
     pub shared: Arc<Mutex<ReactorState>>,
+    pub timers: BinaryHeap<std::cmp::Reverse<(std::time::Instant, mio::Token)>>,
 }
 pub struct ReactorState {
     pub next_token: usize,
@@ -148,6 +172,7 @@ impl ReactorHandle {
         Self {
             registry: reactor.poll.registry().try_clone().unwrap(),
             shared: Arc::new(Mutex::new(ReactorState::new())),
+            timers: BinaryHeap::new(),
         }
     }
 
@@ -172,15 +197,12 @@ impl ReactorHandle {
         } else {
             if let Some(token) = token {
                 let _ = self.registry.reregister(resource, *token, interest);
-               shared.waiters.insert(*token, waker);
+                shared.waiters.insert(*token, waker);
             }
         }
     }
-    pub fn deregister<S>(
-        &mut self,
-        resource: &mut S,
-        token: &mut Option<mio::Token>,
-    ) where
+    pub fn deregister<S>(&mut self, resource: &mut S, token: &mut Option<mio::Token>)
+    where
         S: mio::event::Source + ?Sized,
     {
         let mut shared = self.shared.lock().unwrap();
@@ -227,7 +249,7 @@ pub mod net {
             &mut self,
         ) -> impl std::future::Future<Output = std::io::Result<(TcpStream, SocketAddr)>> + '_
         {
-            println!("Running Accept");
+            // println!("Running Accept");
             std::future::poll_fn(|cx| match self.mio_tcp_listener.accept() {
                 Ok((stream, addr)) => {
                     REACTOR_HANDLE.with(|r| {
@@ -236,7 +258,7 @@ pub mod net {
                         handle.deregister(&mut self.mio_tcp_listener, &mut self.token);
                     });
                     std::task::Poll::Ready(Ok((TcpStream::new(stream), addr)))
-                },
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
@@ -286,7 +308,7 @@ pub mod net {
                     task::Poll::Ready(Ok(result))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    println!("Poll read will block");
+                    // println!("Poll read will block");
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
@@ -380,16 +402,20 @@ pub mod net {
         }
 
         pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            println!("Running Read");
+            // println!("Running Read");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read(cx, buf)).await
         }
 
         pub async fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
-            println!("reading a line");
+            // println!("reading a line");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read_line(cx, buf)).await
         }
 
-        fn poll_write(&mut self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> task::Poll<std::io::Result<usize>> {
+        fn poll_write(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> task::Poll<std::io::Result<usize>> {
             match self.mio_tcp_stream.write(buf) {
                 Ok(n) => {
                     REACTOR_HANDLE.with(|r| {
@@ -399,27 +425,72 @@ pub mod net {
                         handle.deregister(&mut self.mio_tcp_stream, &mut self.token);
                     });
                     task::Poll::Ready(Ok(n))
-                },
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
 
-                        handle.register(&mut self.mio_tcp_stream, cx.waker().clone(), mio::Interest::WRITABLE, &mut self.token);
+                        handle.register(
+                            &mut self.mio_tcp_stream,
+                            cx.waker().clone(),
+                            mio::Interest::WRITABLE,
+                            &mut self.token,
+                        );
                     });
                     return task::Poll::Pending;
-                },
+                }
                 Err(e) => task::Poll::Ready(Err(e)),
             }
         }
 
         pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            println!("Running Write");
+            // println!("Running Write");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write(cx, buf)).await
         }
     }
 }
 
-mod time {
-    
+pub mod time {
+    use crate::REACTOR_HANDLE;
+    use std::pin::Pin;
+    use std::task;
+
+    pub struct Sleep {
+        deadline: std::time::Instant,
+        registered: bool,
+    }
+
+    impl Future for Sleep {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
+            // println!("polling sleep");
+            if std::time::Instant::now() >= self.deadline {
+                task::Poll::Ready(())
+            } else {
+                // println!("scheduling sleep");
+
+                let waker = cx.waker().clone();
+                // println!("Created waker in sleep");
+                if !self.registered {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+
+                        let mut shared = handle.shared.lock().unwrap();
+                        let token = shared.next_token;
+                        shared.next_token += 1;
+                        handle.timers.push(std::cmp::Reverse((self.deadline, mio::Token(token))));
+                        shared.waiters.insert(mio::Token(token), waker);
+                    });
+                }
+                // println!("returning pending in the sleep");
+                task::Poll::Pending
+            }
+        }
+    }
+    pub fn sleep(duration: std::time::Duration) -> Sleep {
+        Sleep { deadline: std::time::Instant::now() + duration, registered: false }
+    }
 }

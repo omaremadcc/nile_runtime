@@ -1,6 +1,6 @@
 // use mio::net::TcpListener;
 use std::net::SocketAddr;
-
+use toy_runtime::time::sleep;
 use toy_runtime::Executor;
 use toy_runtime::net::TcpListener;
 fn main() {
@@ -25,6 +25,10 @@ fn main() {
 }
 
 async fn fetch_some_data(index: usize) {
+    println!("Sleeping on {index}");
+    sleep(std::time::Duration::from_secs(3)).await;
+    println!("Awake on {index}");
+
     let mut tcp_listener =
         TcpListener::bind(format!("127.0.0.1:{index}").parse::<SocketAddr>().unwrap());
 
@@ -41,7 +45,7 @@ async fn fetch_some_data(index: usize) {
             break;
         }
 
-        println!("Received Data: {}", request.trim_end());
+        // println!("Received Data: {}", request.trim_end());
         request.clear();
     }
 
