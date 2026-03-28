@@ -1,5 +1,4 @@
 // use mio::net::TcpListener;
-use std::io::Read;
 use std::net::SocketAddr;
 
 use toy_runtime::Executor;
@@ -30,7 +29,7 @@ async fn fetch_some_data(index: usize) {
     let mut tcp_listener =
         TcpListener::bind(format!("127.0.0.1:{index}").parse::<SocketAddr>().unwrap());
 
-    let (mut stream, addr) = tcp_listener.accept().await.unwrap();
+    let (mut stream, _addr) = tcp_listener.accept().await.unwrap();
     // let mut buffer = [0u8; 4048];
     // let n = stream.read(&mut buffer).await;
     // match n {

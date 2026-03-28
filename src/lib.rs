@@ -114,9 +114,7 @@ impl Reactor {
     }
 
     pub fn epoll(&mut self) {
-        let _ = self
-            .poll
-            .poll(&mut self.events, None);
+        let _ = self.poll.poll(&mut self.events, None);
         for event in self.events.iter() {
             println!("Running Epoll");
             let token = event.token();
@@ -153,14 +151,43 @@ impl ReactorHandle {
         }
     }
 
-    pub fn register<S>(&mut self, resource: &mut S, waker: std::task::Waker, interest: Interest)
-    where S: mio::event::Source + ?Sized
+    pub fn register<S>(
+        &mut self,
+        resource: &mut S,
+        waker: std::task::Waker,
+        interest: Interest,
+        token: &mut Option<mio::Token>,
+    ) where
+        S: mio::event::Source + ?Sized,
     {
         let mut shared = self.shared.lock().unwrap();
-        let token = Token(shared.next_token);
-        shared.next_token += 1;
-        shared.waiters.insert(token, waker);
-        self.registry.register(resource, token, interest);
+        if token.is_none() {
+            let created_token = Token(shared.next_token);
+            *token = Some(created_token);
+
+            shared.next_token += 1;
+
+            let _ = self.registry.register(resource, created_token, interest);
+            shared.waiters.insert(created_token, waker);
+        } else {
+            if let Some(token) = token {
+               shared.waiters.insert(*token, waker);
+            }
+        }
+    }
+    pub fn deregister<S>(
+        &mut self,
+        resource: &mut S,
+        token: &mut Option<mio::Token>,
+    ) where
+        S: mio::event::Source + ?Sized,
+    {
+        let mut shared = self.shared.lock().unwrap();
+        if let Some(token) = token {
+            shared.waiters.remove(token);
+            let _ = self.registry.deregister(resource);
+        }
+        *token = None;
     }
 }
 
@@ -174,8 +201,8 @@ impl ReactorState {
 }
 
 pub mod net {
-    use std::net::SocketAddr;
     use std::io::Read;
+    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::task;
 
@@ -185,11 +212,13 @@ pub mod net {
 
     pub struct TcpListener {
         mio_tcp_listener: mio::net::TcpListener,
+        token: Option<mio::Token>,
     }
     impl TcpListener {
         pub fn bind(addr: std::net::SocketAddr) -> Self {
             Self {
                 mio_tcp_listener: mio::net::TcpListener::bind(addr).unwrap(),
+                token: None,
             }
         }
 
@@ -199,26 +228,26 @@ pub mod net {
         {
             println!("Running Accept");
             std::future::poll_fn(|cx| match self.mio_tcp_listener.accept() {
-                Ok((stream, addr)) => std::task::Poll::Ready(Ok((TcpStream::new(stream), addr))),
+                Ok((stream, addr)) => {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+                        handle.deregister(&mut self.mio_tcp_listener, &mut self.token);
+                    });
+                    std::task::Poll::Ready(Ok((TcpStream::new(stream), addr)))
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    REACTOR_HANDLE
-                        .with(|r| {
-                            let mut handle = r.borrow_mut();
-                            let handle = handle.as_mut().unwrap();
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
 
-                            let mut shared_state = handle.shared.lock().unwrap();
-                            let token = mio::Token(shared_state.next_token);
-                            shared_state.next_token += 1;
-
-                            shared_state.waiters.insert(token, cx.waker().clone());
-
-                            handle.registry.register(
-                                &mut self.mio_tcp_listener,
-                                token,
-                                mio::Interest::READABLE,
-                            )
-                        })
-                        .unwrap();
+                        handle.register(
+                            &mut self.mio_tcp_listener,
+                            cx.waker().clone(),
+                            mio::Interest::READABLE,
+                            &mut self.token,
+                        );
+                    });
 
                     std::task::Poll::Pending
                 }
@@ -230,40 +259,64 @@ pub mod net {
     pub struct TcpStream {
         mio_tcp_stream: mio::net::TcpStream,
         read_buf: Vec<u8>,
+        token: Option<mio::Token>,
     }
+
     impl TcpStream {
         fn new(mio_tcp_stream: mio::net::TcpStream) -> Self {
-            Self { mio_tcp_stream, read_buf: Vec::new() }
+            Self {
+                mio_tcp_stream,
+                read_buf: Vec::new(),
+                token: None,
+            }
         }
-        fn poll_read(&mut self, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> task::Poll<std::io::Result<usize>> {
+        fn poll_read(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> task::Poll<std::io::Result<usize>> {
             match self.mio_tcp_stream.read(buf) {
-                Ok(result) => task::Poll::Ready(Ok(result)),
+                Ok(result) => {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+                        handle.deregister(&mut self.mio_tcp_stream, &mut self.token);
+                    });
+                    task::Poll::Ready(Ok(result))
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     println!("Poll read will block");
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
 
-                        let mut shared = handle.shared.lock().unwrap();
-                        let token = mio::Token(shared.next_token);
-                        shared.next_token += 1;
-
-                        let _ = handle.registry.register(&mut self.mio_tcp_stream, token, mio::Interest::READABLE);
-                        shared.waiters.insert(token, cx.waker().clone());
-
+                        handle.register(
+                            &mut self.mio_tcp_stream,
+                            cx.waker().clone(),
+                            mio::Interest::READABLE,
+                            &mut self.token,
+                        );
                     });
                     return task::Poll::Pending;
-                },
+                }
                 Err(e) => task::Poll::Ready(Err(e)),
             }
         }
 
-        fn poll_read_line(&mut self, cx: &mut std::task::Context<'_>, buf: &mut String) -> task::Poll<std::io::Result<usize>> {
-
+        fn poll_read_line(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut String,
+        ) -> task::Poll<std::io::Result<usize>> {
             buf.clear();
 
             // If there's a full line in the buffer, return it immediately
             if let Some(pos) = self.read_buf.iter().position(|&b| b == b'\n') {
+                REACTOR_HANDLE.with(|r| {
+                    let mut handle = r.borrow_mut();
+                    let handle = handle.as_mut().unwrap();
+                    handle.deregister(&mut self.mio_tcp_stream, &mut self.token);
+                });
                 buf.push_str(str::from_utf8(&self.read_buf[..=pos]).unwrap());
                 self.read_buf.drain(..=pos);
                 return task::Poll::Ready(Ok(pos + 1));
@@ -273,10 +326,15 @@ pub mod net {
             match self.mio_tcp_stream.read(&mut temp_buf) {
                 // If the read returns 0, we've reached EOF, if there is data in the buffer, return it
                 Ok(0) => {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+                        handle.deregister(&mut self.mio_tcp_stream, &mut self.token);
+                    });
                     buf.push_str(str::from_utf8(&self.read_buf).unwrap());
                     self.read_buf.clear();
                     return task::Poll::Ready(Ok(buf.len()));
-                },
+                }
                 Ok(n) => {
                     // Add the new bytes to the buffer
                     self.read_buf.extend_from_slice(&temp_buf[..n]);
@@ -286,12 +344,18 @@ pub mod net {
                         let _ = buf.push_str(str::from_utf8(&self.read_buf[..=pos]).unwrap());
                         let _ = self.read_buf.drain(..=pos).collect::<Vec<u8>>();
                         return task::Poll::Ready(Ok(pos + 1));
-                    } else { // No newline found, register for more data
+                    } else {
+                        // No newline found, register for more data
                         REACTOR_HANDLE.with(|r| {
                             let mut handle = r.borrow_mut();
                             let handle = handle.as_mut().unwrap();
 
-                            handle.register(&mut self.mio_tcp_stream, cx.waker().clone(), Interest::READABLE);
+                            handle.register(
+                                &mut self.mio_tcp_stream,
+                                cx.waker().clone(),
+                                Interest::READABLE,
+                                &mut self.token,
+                            );
                         });
                         task::Poll::Pending
                     }
@@ -301,7 +365,12 @@ pub mod net {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
 
-                        handle.register(&mut self.mio_tcp_stream, cx.waker().clone(), Interest::READABLE);
+                        handle.register(
+                            &mut self.mio_tcp_stream,
+                            cx.waker().clone(),
+                            Interest::READABLE,
+                            &mut self.token,
+                        );
                     });
                     task::Poll::Pending
                 }
