@@ -10,18 +10,6 @@ fn main() {
     executor.spawn(fetch_some_data(2));
     executor.spawn(fetch_some_data(3));
     executor.block_on();
-    // let mut listener = TcpListener::bind("127.0.0.1:3000".parse::<SocketAddr>().unwrap()).unwrap();
-    // loop {
-    //     let res = listener.accept();
-    //     match res {
-    //         Ok((mut stream, addr)) => {
-    //             let mut buffer = [0u8; 1024];
-    //             let n = stream.read(&mut buffer);
-    //             // println!("Received {} bytes from {}", n.unwrap(), addr);
-    //         }
-    //         Err(e) => {}
-    //     }
-    // }
 }
 
 async fn fetch_some_data(index: usize) {

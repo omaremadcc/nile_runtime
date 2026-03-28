@@ -149,7 +149,7 @@ impl Reactor {
 
                 let (_, token) = handle.timers.pop().unwrap().0;
 
-                if let Some(waker) = handle.shared.lock().unwrap().waiters.remove(&token) {
+                if let Some(waker) = shared.waiters.remove(&token) {
                     waker.wake();
                 }
             }
@@ -464,7 +464,7 @@ pub mod time {
     impl Future for Sleep {
         type Output = ();
 
-        fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
             // println!("polling sleep");
             if std::time::Instant::now() >= self.deadline {
                 task::Poll::Ready(())
@@ -474,6 +474,7 @@ pub mod time {
                 let waker = cx.waker().clone();
                 // println!("Created waker in sleep");
                 if !self.registered {
+                    self.registered = true;
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
