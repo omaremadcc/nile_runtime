@@ -171,6 +171,7 @@ impl ReactorHandle {
             shared.waiters.insert(created_token, waker);
         } else {
             if let Some(token) = token {
+                let _ = self.registry.reregister(resource, *token, interest);
                shared.waiters.insert(*token, waker);
             }
         }
@@ -201,7 +202,7 @@ impl ReactorState {
 }
 
 pub mod net {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::task;
@@ -387,5 +388,38 @@ pub mod net {
             println!("reading a line");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read_line(cx, buf)).await
         }
+
+        fn poll_write(&mut self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> task::Poll<std::io::Result<usize>> {
+            match self.mio_tcp_stream.write(buf) {
+                Ok(n) => {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+
+                        handle.deregister(&mut self.mio_tcp_stream, &mut self.token);
+                    });
+                    task::Poll::Ready(Ok(n))
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    REACTOR_HANDLE.with(|r| {
+                        let mut handle = r.borrow_mut();
+                        let handle = handle.as_mut().unwrap();
+
+                        handle.register(&mut self.mio_tcp_stream, cx.waker().clone(), mio::Interest::WRITABLE, &mut self.token);
+                    });
+                    return task::Poll::Pending;
+                },
+                Err(e) => task::Poll::Ready(Err(e)),
+            }
+        }
+
+        pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            println!("Running Write");
+            std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write(cx, buf)).await
+        }
     }
+}
+
+mod time {
+    
 }
