@@ -1,6 +1,6 @@
 use mio::{Events, Interest, Poll, Token};
 use std::cell::RefCell;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -13,21 +13,21 @@ thread_local! {
 }
 pub struct Executor {
     tasks: HashMap<usize, Task>,
-    ready_queue: VecDeque<usize>,
+    ready_queue: Vec<usize>,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
-            ready_queue: VecDeque::new(),
+            ready_queue: Vec::new(),
         }
     }
 
     pub fn spawn(&mut self, task: impl Future<Output = ()> + 'static) {
         let id = self.tasks.len();
         self.tasks.insert(id, Task::new(task, id));
-        self.ready_queue.push_back(id);
+        self.ready_queue.push(id);
     }
 
     pub fn block_on(mut self) {
@@ -39,7 +39,7 @@ impl Executor {
         });
 
         loop {
-            while let Some(task_id) = self.ready_queue.pop_front() {
+            while let Some(task_id) = self.ready_queue.pop() {
                 // println!("running task {}", task_id);
                 let waker = MyWaker::new(task_id, tx.clone());
                 let waker = Waker::from(Arc::new(waker));
@@ -60,7 +60,7 @@ impl Executor {
             }
             reactor.epoll();
             while let Ok(task_id) = rx.try_recv() {
-                self.ready_queue.push_back(task_id);
+                self.ready_queue.push(task_id);
             }
         }
     }
