@@ -3,14 +3,17 @@ use toy_runtime::time::sleep;
 use toy_runtime::Executor;
 use toy_runtime::net::TcpListener;
 
-// $ cargo run --example tcp
-// Sleeping on 1
-// Sleeping on 2
-// Sleeping on 3
-// # (3 seconds pass)
-// Awake on 1
-// Awake on 2
-// Awake on 3
+/// Example output:
+/// ```console
+/// $ cargo run --example tcp
+/// Sleeping on 1
+/// Sleeping on 2
+/// Sleeping on 3
+/// # (3 seconds pass)
+/// Awake on 1
+/// Awake on 2
+/// Awake on 3
+/// ```
 
 fn main() {
     let mut executor = Executor::new();

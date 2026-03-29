@@ -6,11 +6,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::task::{Wake, Waker};
-use std::time::{Instant};
+use std::time::Instant;
 
+// Using thread local to give access to all the methods (tcp_stream, tcp_listener etc..)
 thread_local! {
+    // Using RefCell to allow interior mutability
     pub static REACTOR_HANDLE: RefCell<Option<ReactorHandle>> = RefCell::new(None);
 }
+
+// The executor holds a HashMap of IDs to tasks
+// And a vector of ready tasks IDs
 pub struct Executor {
     tasks: HashMap<usize, Task>,
     ready_queue: Vec<usize>,
@@ -24,30 +29,38 @@ impl Executor {
         }
     }
 
+    // Spawn a new task and add it to the ready queue
+    // The Task will be added to the ready queue by default because it is ready to be polled
     pub fn spawn(&mut self, task: impl Future<Output = ()> + 'static) {
         let id = self.tasks.len();
         self.tasks.insert(id, Task::new(task, id));
         self.ready_queue.push(id);
     }
 
+    // Run Tasks until completion of them all
     pub fn block_on(mut self) {
-        // println!("Started blocking");
+        // Uses a channel to wake tasks
+        // The waker send the task id through the channel
+        // when the executor run out of tasks it consume the IDs
         let (tx, rx) = std::sync::mpsc::channel();
         let mut reactor = Reactor::new();
+        // Initialze the reactor handle in the thread local
         REACTOR_HANDLE.with(|r| {
             *r.borrow_mut() = Some(ReactorHandle::new(&reactor));
         });
 
+        // Looping the tasks
         loop {
+            // Popping the ready queue to get the first task
             while let Some(task_id) = self.ready_queue.pop() {
-                // println!("running task {}", task_id);
+                // Create a waker to this task, It takes the task id and a clone of sender
+                // so it can send the task id through the channel
                 let waker = MyWaker::new(task_id, tx.clone());
                 let waker = Waker::from(Arc::new(waker));
+                // Crafting a context with the waker to pass it to the task's poll method
                 let cx = &mut std::task::Context::from_waker(&waker);
                 let task = self.tasks.get_mut(&task_id).unwrap();
-                // println!("polling task {}", task_id);
                 let result = task.future.as_mut().poll(cx);
-                // println!("poll result: {:?}", result);
                 match result {
                     std::task::Poll::Ready(()) => {
                         self.tasks.remove(&task_id);
@@ -55,10 +68,13 @@ impl Executor {
                     std::task::Poll::Pending => (),
                 }
             }
+            // If there are no tasks left, break the loop
             if self.tasks.is_empty() {
                 break;
             }
+            // Wait for the reactor to notify us of ready tasks
             reactor.epoll();
+            // Consume the channel to get ready tasks IDs
             while let Ok(task_id) = rx.try_recv() {
                 self.ready_queue.push(task_id);
             }
@@ -66,8 +82,11 @@ impl Executor {
     }
 }
 
+// A struct representing a task to be executed by the runtime, it contains the future and the task ID
 pub struct Task {
+    // The future is pinned because futures might include self referential data
     pub future: Pin<Box<dyn Future<Output = ()>>>,
+    // Task Id
     pub id: usize,
 }
 impl Task {
@@ -79,6 +98,7 @@ impl Task {
     }
 }
 
+// Waker struct that contains the task ID and a channel sender to notify the reactor of ready tasks
 pub struct MyWaker {
     task_id: usize,
     tx: Sender<usize>,
@@ -91,6 +111,7 @@ impl MyWaker {
 }
 
 impl Wake for MyWaker {
+    // Wake function on the waker, it sends the task ID to the reactor's channel to notify it of readiness
     fn wake(self: Arc<Self>) {
         self.tx.send(self.task_id).ok();
     }
@@ -100,10 +121,15 @@ impl Wake for MyWaker {
     }
 }
 
+// The Reactor struct that handles the event loop and notifies ready tasks to the runtime
 pub struct Reactor {
+    // Mio::Poll that handles the event loop and notifies ready tasks to the runtime
     pub poll: Poll,
+    // Events that are ready to be processed
     pub events: Events,
+    // Maps tokens to task IDs for quick lookup
     pub token_to_task_id: HashMap<Token, usize>,
+    // The next token to be assigned to a task
     pub next_token: usize,
 }
 impl Reactor {
@@ -116,23 +142,27 @@ impl Reactor {
         }
     }
 
+    // The function to wait until tasks are ready
     pub fn epoll(&mut self) {
-        // println!("Epoll waiting ma man");
         REACTOR_HANDLE.with(|r| {
             let mut handle_ref = r.borrow_mut();
             let handle = handle_ref.as_mut().unwrap();
             let mut shared = handle.shared.lock().unwrap();
 
+            // Get the nearest timer and calculate the duration until it expires
             let timeout = handle
                 .timers
                 .peek()
                 .map(|nearest| nearest.0.0.saturating_duration_since(Instant::now()));
 
+            // Wait for events with timeout equal to the nearest timer
+            // So if no events occur before the timer, the function stop so we can set the function with timer as ready
             let _ = self.poll.poll(&mut self.events, timeout);
 
             for event in self.events.iter() {
                 let token = event.token();
 
+                // Remove the waker from the shared state and wake it up
                 if let Some(waker) = shared.waiters.remove(&token) {
                     waker.wake();
                 }
@@ -140,6 +170,7 @@ impl Reactor {
 
             let now = Instant::now();
 
+            // Wake all the timers that have expired
             while let Some(nearest) = handle.timers.peek() {
                 let deadline = nearest.0.0;
 
@@ -157,13 +188,19 @@ impl Reactor {
     }
 }
 
+// The ReactorHandle struct that holds the registry and shared state for registering and waking tasks
 pub struct ReactorHandle {
+    // Mio Registry that register interest in OS events
     pub registry: mio::Registry,
+    // Shared state that holds the next token and waiters for tasks
     pub shared: Arc<Mutex<ReactorState>>,
+    // A heap for timers so we can get the min in O(1) time
     pub timers: BinaryHeap<std::cmp::Reverse<(std::time::Instant, mio::Token)>>,
 }
 pub struct ReactorState {
+    // The next token to assign to a new registration
     pub next_token: usize,
+    // A map of tokens to wakers for tasks that are waiting on events
     pub waiters: HashMap<mio::Token, std::task::Waker>,
 }
 
@@ -176,6 +213,7 @@ impl ReactorHandle {
         }
     }
 
+    // A function to register a waker to an os event
     pub fn register<S>(
         &mut self,
         resource: &mut S,
@@ -186,6 +224,7 @@ impl ReactorHandle {
         S: mio::event::Source + ?Sized,
     {
         let mut shared = self.shared.lock().unwrap();
+        // if there isn't a token, create a new one and register it with the registry
         if token.is_none() {
             let created_token = Token(shared.next_token);
             *token = Some(created_token);
@@ -194,13 +233,15 @@ impl ReactorHandle {
 
             let _ = self.registry.register(resource, created_token, interest);
             shared.waiters.insert(created_token, waker);
-        } else {
+        } else { // if there is a token, reregister it with the registry
             if let Some(token) = token {
                 let _ = self.registry.reregister(resource, *token, interest);
                 shared.waiters.insert(*token, waker);
             }
         }
     }
+
+    // A function to deregister a resource from the reactor
     pub fn deregister<S>(&mut self, resource: &mut S, token: &mut Option<mio::Token>)
     where
         S: mio::event::Source + ?Sized,
@@ -223,6 +264,7 @@ impl ReactorState {
     }
 }
 
+// The module containing net types and implementations
 pub mod net {
     use std::io::{Read, Write};
     use std::net::SocketAddr;
@@ -233,6 +275,7 @@ pub mod net {
 
     use crate::REACTOR_HANDLE;
 
+    // a wrapper for TcpListener that registers itself with the reactor
     pub struct TcpListener {
         mio_tcp_listener: mio::net::TcpListener,
         token: Option<mio::Token>,
@@ -245,12 +288,14 @@ pub mod net {
             }
         }
 
+        // asynchronously accepts a new connection
         pub fn accept(
             &mut self,
         ) -> impl std::future::Future<Output = std::io::Result<(TcpStream, SocketAddr)>> + '_
         {
-            // println!("Running Accept");
+            // returns a PollFn
             std::future::poll_fn(|cx| match self.mio_tcp_listener.accept() {
+                // If got a connection, deregister the listener and return the stream
                 Ok((stream, addr)) => {
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
@@ -259,6 +304,7 @@ pub mod net {
                     });
                     std::task::Poll::Ready(Ok((TcpStream::new(stream), addr)))
                 }
+                // If would block, register the listener and return pending
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
@@ -281,6 +327,7 @@ pub mod net {
 
     pub struct TcpStream {
         mio_tcp_stream: mio::net::TcpStream,
+        // a buf for reading slipover bytes
         read_buf: Vec<u8>,
         token: Option<mio::Token>,
     }
@@ -307,8 +354,8 @@ pub mod net {
                     });
                     task::Poll::Ready(Ok(result))
                 }
+                // If would block, register for read readiness and return Pending
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // println!("Poll read will block");
                     REACTOR_HANDLE.with(|r| {
                         let mut handle = r.borrow_mut();
                         let handle = handle.as_mut().unwrap();
@@ -359,7 +406,6 @@ pub mod net {
                     return task::Poll::Ready(Ok(buf.len()));
                 }
                 Ok(n) => {
-                    // Add the new bytes to the buffer
                     self.read_buf.extend_from_slice(&temp_buf[..n]);
 
                     if let Some(pos) = self.read_buf.iter().position(|&b| b == b'\n') {
@@ -402,12 +448,10 @@ pub mod net {
         }
 
         pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            // println!("Running Read");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read(cx, buf)).await
         }
 
         pub async fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
-            // println!("reading a line");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read_line(cx, buf)).await
         }
 
@@ -445,17 +489,18 @@ pub mod net {
         }
 
         pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            // println!("Running Write");
             std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write(cx, buf)).await
         }
     }
 }
 
+// time module
 pub mod time {
     use crate::REACTOR_HANDLE;
     use std::pin::Pin;
     use std::task;
 
+    // Sleep struct that implements Future
     pub struct Sleep {
         deadline: std::time::Instant,
         registered: bool,
@@ -464,15 +509,17 @@ pub mod time {
     impl Future for Sleep {
         type Output = ();
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
-            // println!("polling sleep");
+        // implementing poll for sleep
+        fn poll(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> task::Poll<Self::Output> {
+            // if the timer expired return ready
             if std::time::Instant::now() >= self.deadline {
                 task::Poll::Ready(())
             } else {
-                // println!("scheduling sleep");
-
+                // if the timer still valid and isn't registered register it and return pending
                 let waker = cx.waker().clone();
-                // println!("Created waker in sleep");
                 if !self.registered {
                     self.registered = true;
                     REACTOR_HANDLE.with(|r| {
@@ -482,16 +529,22 @@ pub mod time {
                         let mut shared = handle.shared.lock().unwrap();
                         let token = shared.next_token;
                         shared.next_token += 1;
-                        handle.timers.push(std::cmp::Reverse((self.deadline, mio::Token(token))));
+                        handle
+                            .timers
+                            .push(std::cmp::Reverse((self.deadline, mio::Token(token))));
                         shared.waiters.insert(mio::Token(token), waker);
                     });
                 }
-                // println!("returning pending in the sleep");
                 task::Poll::Pending
             }
         }
     }
+
+    // a constructor for sleep
     pub fn sleep(duration: std::time::Duration) -> Sleep {
-        Sleep { deadline: std::time::Instant::now() + duration, registered: false }
+        Sleep {
+            deadline: std::time::Instant::now() + duration,
+            registered: false,
+        }
     }
 }
