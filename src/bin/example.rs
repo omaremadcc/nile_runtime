@@ -1,8 +1,17 @@
-// use mio::net::TcpListener;
 use std::net::SocketAddr;
 use toy_runtime::time::sleep;
 use toy_runtime::Executor;
 use toy_runtime::net::TcpListener;
+
+// $ cargo run --example tcp
+// Sleeping on 1
+// Sleeping on 2
+// Sleeping on 3
+// # (3 seconds pass)
+// Awake on 1
+// Awake on 2
+// Awake on 3
+
 fn main() {
     let mut executor = Executor::new();
 
@@ -18,7 +27,7 @@ async fn fetch_some_data(index: usize) {
     println!("Awake on {index}");
 
     let mut tcp_listener =
-        TcpListener::bind(format!("127.0.0.1:{index}").parse::<SocketAddr>().unwrap());
+        TcpListener::bind(format!("127.0.0.1:{}", 8080 + index).parse::<SocketAddr>().unwrap());
 
     let (mut stream, _addr) = tcp_listener.accept().await.unwrap();
 
@@ -33,7 +42,6 @@ async fn fetch_some_data(index: usize) {
             break;
         }
 
-        // println!("Received Data: {}", request.trim_end());
         request.clear();
     }
 
